@@ -274,7 +274,12 @@ func (m *hetznerManager) serverForNode(node *apiv1.Node) (*hcloud.Server, error)
 	} else {
 		nodeIdOrName = node.Name
 	}
-
+	
+	nodeGroupId, exists := node.Labels["autoscaling.k8s.io/nodegroup"]
+	if exists && nodeGroupId == "skip" {
+		return nil, nil
+	}
+	
 	server, err := m.cachedServers.getServer(nodeIdOrName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get servers for node %s error: %v", node.Name, err)
