@@ -28,7 +28,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -116,7 +116,7 @@ func (r *recommender) UpdateVPAs() {
 				pods := r.clusterState.GetMatchingPods(vpa)
 				klog.Infof("MatchingPods: %+v", pods)
 				if len(pods) != vpa.PodCount {
-					klog.Errorf("ClusterState pod count and matching pods disagree for vpa %v/%v", vpa.ID.Namespace, vpa.ID.VpaName)
+					klog.Errorf("ClusterState pod count and matching pods disagree for VPA %s", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName))
 				}
 			}
 		}
@@ -126,7 +126,7 @@ func (r *recommender) UpdateVPAs() {
 			r.vpaClient.VerticalPodAutoscalers(vpa.ID.Namespace), vpa.ID.VpaName, vpa.AsStatus(), &observedVpa.Status)
 		if err != nil {
 			klog.Errorf(
-				"Cannot update VPA %v/%v object. Reason: %+v", vpa.ID.Namespace, vpa.ID.VpaName, err)
+				"Cannot update VPA %s object. Reason: %+v", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName), err)
 		}
 	}
 }
@@ -154,7 +154,7 @@ func (r *recommender) RunOnce() {
 
 	klog.V(3).Infof("Recommender Run")
 
-	r.clusterStateFeeder.LoadVPAs()
+	r.clusterStateFeeder.LoadVPAs(ctx)
 	timer.ObserveStep("LoadVPAs")
 
 	r.clusterStateFeeder.LoadPods()
@@ -170,7 +170,7 @@ func (r *recommender) RunOnce() {
 	r.MaintainCheckpoints(ctx, *minCheckpointsPerRun)
 	timer.ObserveStep("MaintainCheckpoints")
 
-	r.clusterState.RateLimitedGarbageCollectAggregateCollectionStates(time.Now(), r.controllerFetcher)
+	r.clusterState.RateLimitedGarbageCollectAggregateCollectionStates(ctx, time.Now(), r.controllerFetcher)
 	timer.ObserveStep("GarbageCollect")
 	klog.V(3).Infof("ClusterState is tracking %d aggregated container states", r.clusterState.StateMapSize())
 }

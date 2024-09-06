@@ -36,6 +36,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/provisioningrequest/checkcapacity"
 	"k8s.io/autoscaler/cluster-autoscaler/provisioningrequest/provreqclient"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/predicatechecker"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/scheduling"
 	kubelet_config "k8s.io/kubernetes/pkg/kubelet/apis/config"
 
 	"github.com/spf13/pflag"
@@ -58,6 +59,9 @@ import (
 	ca_processors "k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupset"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodeinfosprovider"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/podinjection"
+	podinjectionbackoff "k8s.io/autoscaler/cluster-autoscaler/processors/podinjection/backoff"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/pods"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/provreq"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates/emptycandidates"
@@ -106,6 +110,7 @@ func multiStringFlag(name string, usage string) *MultiStringFlag {
 }
 
 var (
+	leaseResourceName       = flag.String("lease-resource-name", "cluster-autoscaler", "The lease resource to use in leader election.")
 	clusterName             = flag.String("cluster-name", "", "Autoscaled cluster name, if available")
 	address                 = flag.String("address", ":8085", "The address to expose prometheus metrics.")
 	kubernetes              = flag.String("kubernetes", "", "Kubernetes master location. Leave blank for default")
@@ -163,7 +168,7 @@ var (
 		"Cloud provider type. Available values: ["+strings.Join(cloudBuilder.AvailableCloudProviders, ",")+"]")
 	maxBulkSoftTaintCount      = flag.Int("max-bulk-soft-taint-count", 10, "Maximum number of nodes that can be tainted/untainted PreferNoSchedule at the same time. Set to 0 to turn off such tainting.")
 	maxBulkSoftTaintTime       = flag.Duration("max-bulk-soft-taint-time", 3*time.Second, "Maximum duration of tainting/untainting nodes as PreferNoSchedule at the same time.")
-	maxEmptyBulkDeleteFlag     = flag.Int("max-empty-bulk-delete", 10, "Maximum number of empty nodes that can be deleted at the same time.")
+	maxEmptyBulkDeleteFlag     = flag.Int("max-empty-bulk-delete", 10, "Maximum number of empty nodes that can be deleted at the same time. DEPRECATED: Use --max-scale-down-parallelism instead.")
 	maxGracefulTerminationFlag = flag.Int("max-graceful-termination-sec", 10*60, "Maximum number of seconds CA waits for pod termination when trying to scale down a node. "+
 		"This flag is mutually exclusion with drain-priority-config flag which allows more configuration options.")
 	maxTotalUnreadyPercentage = flag.Float64("max-total-unready-percentage", 45, "Maximum percentage of unready nodes in the cluster.  After this is exceeded, CA halts operations")
@@ -179,8 +184,9 @@ var (
 		"node-group-auto-discovery",
 		"One or more definition(s) of node group auto-discovery. "+
 			"A definition is expressed `<name of discoverer>:[<key>[=<value>]]`. "+
-			"The `aws` and `gce` cloud providers are currently supported. AWS matches by ASG tags, e.g. `asg:tag=tagKey,anotherTagKey`. "+
+			"The `aws`, `gce`, and `azure` cloud providers are currently supported. AWS matches by ASG tags, e.g. `asg:tag=tagKey,anotherTagKey`. "+
 			"GCE matches by IG name prefix, and requires you to specify min and max nodes per IG, e.g. `mig:namePrefix=pfx,min=0,max=10` "+
+			"Azure matches by VMSS tags, similar to AWS. And you can optionally specify a default min and max size, e.g. `label:tag=tagKey,anotherTagKey=bar,min=0,max=600`. "+
 			"Can be used multiple times.")
 
 	estimatorFlag = flag.String("estimator", estimator.BinpackingEstimatorName,
@@ -199,6 +205,7 @@ var (
 	writeStatusConfigMapFlag         = flag.Bool("write-status-configmap", true, "Should CA write status information to a configmap")
 	statusConfigMapName              = flag.String("status-config-map-name", "cluster-autoscaler-status", "Status configmap name")
 	maxInactivityTimeFlag            = flag.Duration("max-inactivity", 10*time.Minute, "Maximum time from last recorded autoscaler activity before automatic restart")
+	maxBinpackingTimeFlag            = flag.Duration("max-binpacking-time", 5*time.Minute, "Maximum time spend on binpacking for a single scale-up. If binpacking is limited by this, scale-up will continue with the already calculated scale-up options.")
 	maxFailingTimeFlag               = flag.Duration("max-failing-time", 15*time.Minute, "Maximum time from last recorded successful autoscaler run before automatic restart")
 	balanceSimilarNodeGroupsFlag     = flag.Bool("balance-similar-node-groups", false, "Detect similar node groups and balance the number of nodes between them")
 	nodeAutoprovisioningEnabled      = flag.Bool("node-autoprovisioning-enabled", false, "Should CA autoprovision node groups when needed.This flag is deprecated and will be removed in future releases.")
@@ -217,10 +224,10 @@ var (
 	awsUseStaticInstanceList  = flag.Bool("aws-use-static-instance-list", false, "Should CA fetch instance types in runtime or use a static list. AWS only")
 
 	// GCE specific flags
-	concurrentGceRefreshes            = flag.Int("gce-concurrent-refreshes", 1, "Maximum number of concurrent refreshes per cloud object type.")
-	gceMigInstancesMinRefreshWaitTime = flag.Duration("gce-mig-instances-min-refresh-wait-time", 5*time.Second, "The minimum time which needs to pass before GCE MIG instances from a given MIG can be refreshed.")
-	_                                 = flag.Bool("gce-expander-ephemeral-storage-support", true, "Whether scale-up takes ephemeral storage resources into account for GCE cloud provider (Deprecated, to be removed in 1.30+)")
-
+	concurrentGceRefreshes             = flag.Int("gce-concurrent-refreshes", 1, "Maximum number of concurrent refreshes per cloud object type.")
+	gceMigInstancesMinRefreshWaitTime  = flag.Duration("gce-mig-instances-min-refresh-wait-time", 5*time.Second, "The minimum time which needs to pass before GCE MIG instances from a given MIG can be refreshed.")
+	_                                  = flag.Bool("gce-expander-ephemeral-storage-support", true, "Whether scale-up takes ephemeral storage resources into account for GCE cloud provider (Deprecated, to be removed in 1.30+)")
+	bulkGceMigInstancesListingEnabled  = flag.Bool("bulk-mig-instances-listing-enabled", false, "Fetch GCE mig instances in bulk instead of per mig")
 	enableProfiling                    = flag.Bool("profiling", false, "Is debug/pprof endpoint enabled")
 	clusterAPICloudConfigAuthoritative = flag.Bool("clusterapi-cloud-config-authoritative", false, "Treat the cloud-config flag authoritatively (do not fallback to using kubeconfig flag). ClusterAPI only")
 	cordonNodeBeforeTerminate          = flag.Bool("cordon-node-before-terminating", false, "Should CA cordon nodes before terminating during downscale process")
@@ -248,7 +255,6 @@ var (
 	minReplicaCount                         = flag.Int("min-replica-count", 0, "Minimum number or replicas that a replica set or replication controller should have to allow their pods deletion in scale down")
 	nodeDeleteDelayAfterTaint               = flag.Duration("node-delete-delay-after-taint", 5*time.Second, "How long to wait before deleting a node after tainting it")
 	scaleDownSimulationTimeout              = flag.Duration("scale-down-simulation-timeout", 30*time.Second, "How long should we run scale down simulation.")
-	parallelDrain                           = flag.Bool("parallel-drain", true, "Whether to allow parallel drain of nodes. This flag is deprecated and will be removed in future releases.")
 	maxCapacityMemoryDifferenceRatio        = flag.Float64("memory-difference-ratio", config.DefaultMaxCapacityMemoryDifferenceRatio, "Maximum difference in memory capacity between two similar node groups to be considered for balancing. Value is a ratio of the smaller node group's memory capacity.")
 	maxFreeDifferenceRatio                  = flag.Float64("max-free-difference-ratio", config.DefaultMaxFreeDifferenceRatio, "Maximum difference in free resources between two similar node groups to be considered for balancing. Value is a ratio of the smaller node group's free resource.")
 	maxAllocatableDifferenceRatio           = flag.Float64("max-allocatable-difference-ratio", config.DefaultMaxAllocatableDifferenceRatio, "Maximum difference in allocatable resources between two similar node groups to be considered for balancing. Value is a ratio of the smaller node group's allocatable resource.")
@@ -262,6 +268,9 @@ var (
 			"Eg. flag usage:  '10000:20,1000:100,0:60'")
 	provisioningRequestsEnabled = flag.Bool("enable-provisioning-requests", false, "Whether the clusterautoscaler will be handling the ProvisioningRequest CRs.")
 	frequentLoopsEnabled        = flag.Bool("frequent-loops-enabled", false, "Whether clusterautoscaler triggers new iterations more frequently when it's needed")
+	asyncNodeGroupsEnabled      = flag.Bool("async-node-groups", false, "Whether clusterautoscaler creates and deletes node groups asynchronously. Experimental: requires cloud provider supporting async node group operations, enable at your own risk.")
+	proactiveScaleupEnabled     = flag.Bool("enable-proactive-scaleup", false, "Whether to enable/disable proactive scale-ups, defaults to false")
+	podInjectionLimit           = flag.Int("pod-injection-limit", 5000, "Limits total number of pods while injecting fake pods. If unschedulable pods already exceeds the limit, pod injection is disabled but pods are not truncated.")
 )
 
 func isFlagPassed(name string) bool {
@@ -290,9 +299,6 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 	parsedGpuTotal, err := parseMultipleGpuLimits(*gpuTotal)
 	if err != nil {
 		klog.Fatalf("Failed to parse flags: %v", err)
-	}
-	if *maxDrainParallelismFlag > 1 && !*parallelDrain {
-		klog.Fatalf("Invalid configuration, could not use --max-drain-parallelism > 1 if --parallel-drain is false")
 	}
 
 	// in order to avoid inconsistent deletion thresholds for the legacy planner and the new actuator, the max-empty-bulk-delete,
@@ -405,6 +411,7 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 			ConcurrentRefreshes:            *concurrentGceRefreshes,
 			MigInstancesMinRefreshWaitTime: *gceMigInstancesMinRefreshWaitTime,
 			LocalSSDDiskSizeProvider:       localssdsize.NewSimpleLocalSSDProvider(),
+			BulkMigInstancesListingEnabled: *bulkGceMigInstancesListingEnabled,
 		},
 		ClusterAPICloudConfigAuthoritative: *clusterAPICloudConfigAuthoritative,
 		CordonNodeBeforeTerminate:          *cordonNodeBeforeTerminate,
@@ -419,13 +426,13 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 		RecordDuplicatedEvents:             *recordDuplicatedEvents,
 		MaxNodesPerScaleUp:                 *maxNodesPerScaleUp,
 		MaxNodeGroupBinpackingDuration:     *maxNodeGroupBinpackingDuration,
+		MaxBinpackingTime:                  *maxBinpackingTimeFlag,
 		NodeDeletionBatcherInterval:        *nodeDeletionBatcherInterval,
 		SkipNodesWithSystemPods:            *skipNodesWithSystemPods,
 		SkipNodesWithLocalStorage:          *skipNodesWithLocalStorage,
 		MinReplicaCount:                    *minReplicaCount,
 		NodeDeleteDelayAfterTaint:          *nodeDeleteDelayAfterTaint,
 		ScaleDownSimulationTimeout:         *scaleDownSimulationTimeout,
-		ParallelDrain:                      *parallelDrain,
 		SkipNodesWithCustomControllerPods:  *skipNodesWithCustomControllerPods,
 		NodeGroupSetRatios: config.NodeGroupDifferenceRatios{
 			MaxCapacityMemoryDifferenceRatio: *maxCapacityMemoryDifferenceRatio,
@@ -435,6 +442,7 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 		DynamicNodeDeleteDelayAfterTaintEnabled: *dynamicNodeDeleteDelayAfterTaintEnabled,
 		BypassedSchedulers:                      scheduler_util.GetBypassedSchedulersMap(*bypassedSchedulers),
 		ProvisioningRequestEnabled:              *provisioningRequestsEnabled,
+		AsyncNodeGroupsEnabled:                  *asyncNodeGroupsEnabled,
 	}
 }
 
@@ -491,7 +499,7 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 
 	opts.Processors = ca_processors.DefaultProcessors(autoscalingOptions)
 	opts.Processors.TemplateNodeInfoProvider = nodeinfosprovider.NewDefaultTemplateNodeInfoProvider(nodeInfoCacheExpireTime, *forceDaemonSets)
-	podListProcessor := podlistprocessor.NewDefaultPodListProcessor(opts.PredicateChecker)
+	podListProcessor := podlistprocessor.NewDefaultPodListProcessor(opts.PredicateChecker, scheduling.ScheduleAnywhere)
 
 	if autoscalingOptions.ProvisioningRequestEnabled {
 		podListProcessor.AddProcessor(provreq.NewProvisioningRequestPodsFilter(provreq.NewDefautlEventManager()))
@@ -508,7 +516,7 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 		scaleUpOrchestrator := provreqorchestrator.NewWrapperOrchestrator(provreqOrchestrator)
 
 		opts.ScaleUpOrchestrator = scaleUpOrchestrator
-		provreqProcesor := provreq.NewProvReqProcessor(client)
+		provreqProcesor := provreq.NewProvReqProcessor(client, opts.PredicateChecker)
 		if err != nil {
 			return nil, err
 		}
@@ -518,17 +526,30 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 			return nil, err
 		}
 		podListProcessor.AddProcessor(injector)
+		podListProcessor.AddProcessor(provreqProcesor)
 	}
+
+	if *proactiveScaleupEnabled {
+		podInjectionBackoffRegistry := podinjectionbackoff.NewFakePodControllerRegistry()
+
+		podInjectionPodListProcessor := podinjection.NewPodInjectionPodListProcessor(podInjectionBackoffRegistry)
+		enforceInjectedPodsLimitProcessor := podinjection.NewEnforceInjectedPodsLimitProcessor(*podInjectionLimit)
+
+		podListProcessor = pods.NewCombinedPodListProcessor([]pods.PodListProcessor{podInjectionPodListProcessor, podListProcessor, enforceInjectedPodsLimitProcessor})
+
+		// FakePodsScaleUpStatusProcessor processor needs to be the first processor in ScaleUpStatusProcessor as it filters out fake pods from
+		// Scale Up status so that we don't emit events.
+		opts.Processors.ScaleUpStatusProcessor = podinjection.NewFakePodsScaleUpStatusProcessor(podInjectionBackoffRegistry)
+	}
+
 	opts.Processors.PodListProcessor = podListProcessor
 	scaleDownCandidatesComparers := []scaledowncandidates.CandidatesComparer{}
-	if autoscalingOptions.ParallelDrain {
-		sdCandidatesSorting := previouscandidates.NewPreviousCandidates()
-		scaleDownCandidatesComparers = []scaledowncandidates.CandidatesComparer{
-			emptycandidates.NewEmptySortingProcessor(emptycandidates.NewNodeInfoGetter(opts.ClusterSnapshot), deleteOptions, drainabilityRules),
-			sdCandidatesSorting,
-		}
-		opts.Processors.ScaleDownCandidatesNotifier.Register(sdCandidatesSorting)
+	sdCandidatesSorting := previouscandidates.NewPreviousCandidates()
+	scaleDownCandidatesComparers = []scaledowncandidates.CandidatesComparer{
+		emptycandidates.NewEmptySortingProcessor(emptycandidates.NewNodeInfoGetter(opts.ClusterSnapshot), deleteOptions, drainabilityRules),
+		sdCandidatesSorting,
 	}
+	opts.Processors.ScaleDownCandidatesNotifier.Register(sdCandidatesSorting)
 
 	cp := scaledowncandidates.NewCombinedScaleDownCandidatesProcessor()
 	cp.Register(scaledowncandidates.NewScaleDownCandidatesSortingProcessor(scaleDownCandidatesComparers))
@@ -623,10 +644,6 @@ func run(healthCheck *metrics.HealthCheck, debuggingSnapshotter debuggingsnapsho
 func main() {
 	klog.InitFlags(nil)
 
-	leaderElection := defaultLeaderElectionConfiguration()
-	leaderElection.LeaderElect = true
-	componentopts.BindLeaderElectionFlags(&leaderElection, pflag.CommandLine)
-
 	featureGate := utilfeature.DefaultMutableFeatureGate
 	loggingConfig := logsapi.NewLoggingConfiguration()
 
@@ -637,6 +654,10 @@ func main() {
 	logsapi.AddFlags(loggingConfig, pflag.CommandLine)
 	featureGate.AddFlag(pflag.CommandLine)
 	kube_flag.InitFlags()
+
+	leaderElection := defaultLeaderElectionConfiguration()
+	leaderElection.LeaderElect = true
+	componentopts.BindLeaderElectionFlags(&leaderElection, pflag.CommandLine)
 
 	logs.InitLogs()
 	if err := logsapi.ValidateAndApply(loggingConfig, featureGate); err != nil {
@@ -724,7 +745,7 @@ func defaultLeaderElectionConfiguration() componentbaseconfig.LeaderElectionConf
 		RenewDeadline: metav1.Duration{Duration: defaultRenewDeadline},
 		RetryPeriod:   metav1.Duration{Duration: defaultRetryPeriod},
 		ResourceLock:  resourcelock.LeasesResourceLock,
-		ResourceName:  "cluster-autoscaler",
+		ResourceName:  *leaseResourceName,
 	}
 }
 

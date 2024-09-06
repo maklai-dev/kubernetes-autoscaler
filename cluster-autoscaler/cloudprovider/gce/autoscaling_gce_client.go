@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"path"
 	"regexp"
 	"strings"
@@ -71,6 +70,10 @@ const (
 
 	// ErrorCodeOther is an error code used in InstanceErrorInfo if other error occurs.
 	ErrorCodeOther = "OTHER"
+
+	// MaxInstancesLogged is the maximum number of instances for which we will
+	// log detailed information for each Instance.List API call
+	MaxInstancesLogged = 20
 )
 
 var (
@@ -92,7 +95,9 @@ var (
 // GceInstance extends cloudprovider.Instance with GCE specific numeric id.
 type GceInstance struct {
 	cloudprovider.Instance
-	NumericId uint64
+	NumericId            uint64
+	Igm                  GceRef
+	InstanceTemplateName string
 }
 
 // AutoscalingGceClient is used for communicating with GCE API.
@@ -101,6 +106,7 @@ type AutoscalingGceClient interface {
 	FetchMachineType(zone, machineType string) (*gce.MachineType, error)
 	FetchMachineTypes(zone string) ([]*gce.MachineType, error)
 	FetchAllMigs(zone string) ([]*gce.InstanceGroupManager, error)
+	FetchAllInstances(project, zone string, filter string) ([]GceInstance, error)
 	FetchMigTargetSize(GceRef) (int64, error)
 	FetchMigBasename(GceRef) (string, error)
 	FetchMigInstances(GceRef) ([]GceInstance, error)
@@ -360,6 +366,71 @@ func (client *autoscalingGceClientV1) DeleteInstances(migRef GceRef, instances [
 	return client.WaitForOperation(op.Name, op.OperationType, migRef.Project, migRef.Zone)
 }
 
+func (client *autoscalingGceClientV1) FetchAllInstances(project, zone, filter string) ([]GceInstance, error) {
+	registerRequest("instances", "list")
+	instances := make([]GceInstance, 0)
+	loggingQuota := klogx.NewLoggingQuota(MaxInstancesLogged)
+	err := client.gceService.Instances.List(project, zone).Filter(filter).Pages(context.Background(), func(page *gce.InstanceList) error {
+		for _, gceInstance := range page.Items {
+			instance, err := externalToInternalInstance(gceInstance, loggingQuota)
+			if err != nil {
+				klog.Errorf("Error converting instance to GceInstance: %v", err)
+				continue
+			}
+			instances = append(instances, instance)
+		}
+		return nil
+	})
+	if err != nil {
+		klog.Errorf("Failed listing Instances in zone %s, project %s: %v", zone, project, err)
+		return nil, err
+	}
+	klogx.V(5).Over(loggingQuota).Infof("Unable to parse IGM for %v other instances", -loggingQuota.Left())
+	return instances, nil
+}
+
+func externalToInternalInstance(gceInstance *gce.Instance, loggingQuota *klogx.Quota) (GceInstance, error) {
+	if gceInstance == nil {
+		return GceInstance{}, fmt.Errorf("instance should not be <nil>")
+	}
+	ref, err := ParseInstanceUrlRef(gceInstance.SelfLink)
+	if err != nil {
+		return GceInstance{}, fmt.Errorf("received error while parsing of the instance url: %v", err)
+	}
+	return GceInstance{
+		Instance: cloudprovider.Instance{
+			Id: ref.ToProviderId(),
+			Status: &cloudprovider.InstanceStatus{
+				State: instanceLifeCycleToInstanceState(gceInstance.Status),
+			},
+		},
+		NumericId: gceInstance.Id,
+		Igm:       createIgmRef(gceInstance, ref.Project, loggingQuota),
+	}, nil
+}
+
+func createIgmRef(gceInstance *gce.Instance, project string, loggingQuota *klogx.Quota) GceRef {
+	createdBy := ""
+	for _, item := range gceInstance.Metadata.Items {
+		if item.Key == "created-by" && item.Value != nil {
+			createdBy = *item.Value
+		}
+	}
+	if createdBy == "" {
+		klogx.V(5).UpTo(loggingQuota).Infof("Unable to find 'created-by' field for the instance %v", gceInstance.SelfLink)
+		return GceRef{}
+	}
+	igmRef, err := ParseIgmUrlRef(createdBy)
+	if err != nil {
+		klogx.V(5).UpTo(loggingQuota).Infof("Unable to parse IGM for %v because of %v", gceInstance.SelfLink, err)
+		return GceRef{}
+	}
+	// project is overwritten to make it compatible with CA mig refs which uses project
+	// name instead of project number. igm url has project number not project name.
+	igmRef.Project = project
+	return igmRef
+}
+
 func (client *autoscalingGceClientV1) FetchMigInstances(migRef GceRef) ([]GceInstance, error) {
 	registerRequest("instance_group_managers", "list_managed_instances")
 	b := newInstanceListBuilder(migRef)
@@ -411,6 +482,13 @@ func (i *instanceListBuilder) gceInstanceToInstance(ref GceRef, gceInstance *gce
 			},
 		},
 		NumericId: gceInstance.Id,
+	}
+
+	if gceInstance.Version != nil {
+		instanceTemplate, err := InstanceTemplateNameFromUrl(gceInstance.Version.InstanceTemplate)
+		if err == nil {
+			instance.InstanceTemplateName = instanceTemplate.Name
+		}
 	}
 
 	if instance.Status.State != cloudprovider.InstanceCreating {
@@ -521,6 +599,17 @@ func getInstanceState(currentAction string) cloudprovider.InstanceState {
 	}
 }
 
+func instanceLifeCycleToInstanceState(status string) cloudprovider.InstanceState {
+	switch status {
+	case "PROVISIONING", "STAGING":
+		return cloudprovider.InstanceCreating
+	case "STOPPING", "TERMINATED":
+		return cloudprovider.InstanceDeleting
+	default:
+		return cloudprovider.InstanceRunning
+	}
+}
+
 func getLastAttemptErrors(instance *gce.ManagedInstance) []*gce.ManagedInstanceLastAttemptErrorsErrors {
 	if instance.LastAttempt != nil && instance.LastAttempt.Errors != nil {
 		return instance.LastAttempt.Errors.Errors
@@ -616,7 +705,13 @@ func (client *autoscalingGceClientV1) FetchAvailableDiskTypes() (map[string][]st
 	if err := req.Pages(context.TODO(), func(page *gce.DiskTypeAggregatedList) error {
 		for _, diskTypesScopedList := range page.Items {
 			for _, diskType := range diskTypesScopedList.DiskTypes {
-				availableDiskTypes[diskType.Zone] = append(availableDiskTypes[diskType.Zone], diskType.Name)
+				// skip data for regions
+				if diskType.Zone == "" {
+					continue
+				}
+				// convert URL of the zone, into the short name, e.g. us-central1-a
+				zone := path.Base(diskType.Zone)
+				availableDiskTypes[zone] = append(availableDiskTypes[zone], diskType.Name)
 			}
 		}
 		return nil
@@ -640,17 +735,7 @@ func (client *autoscalingGceClientV1) FetchMigTemplateName(migRef GceRef) (Insta
 		}
 		return InstanceTemplateName{}, err
 	}
-	templateUrl, err := url.Parse(igm.InstanceTemplate)
-	if err != nil {
-		return InstanceTemplateName{}, err
-	}
-	regional, err := IsInstanceTemplateRegional(templateUrl.String())
-	if err != nil {
-		return InstanceTemplateName{}, err
-	}
-
-	_, templateName := path.Split(templateUrl.EscapedPath())
-	return InstanceTemplateName{templateName, regional}, nil
+	return InstanceTemplateNameFromUrl(igm.InstanceTemplate)
 }
 
 func (client *autoscalingGceClientV1) FetchMigTemplate(migRef GceRef, templateName string, regional bool) (*gce.InstanceTemplate, error) {
