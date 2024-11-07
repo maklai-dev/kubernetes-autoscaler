@@ -6,6 +6,7 @@
 - [How can I apply VPA to my Custom Resource?](#how-can-i-apply-vpa-to-my-custom-resource)
 - [How can I use Prometheus as a history provider for the VPA recommender?](#how-can-i-use-prometheus-as-a-history-provider-for-the-vpa-recommender)
 - [I get recommendations for my single pod replicaSet, but they are not applied. Why?](#i-get-recommendations-for-my-single-pod-replicaset-but-they-are-not-applied)
+- [Can I run the VPA in an HA configuration?](#can-i-run-the-vpa-in-an-ha-configuration)
 - [What are the parameters to VPA recommender?](#what-are-the-parameters-to-vpa-recommender)
 - [What are the parameters to VPA updater?](#what-are-the-parameters-to-vpa-updater)
 
@@ -156,9 +157,21 @@ spec:
   - name: updater
     args:
     - "--min-replicas=1"
+    - "--v=4"
+    - "--stderrthreshold=info"
 ```
 
 and then deploy it manually if your vpa is already configured.
+
+### Can I run the VPA in an HA configuration?
+
+The VPA admission-controller can be run with multiple active Pods at any given time.
+
+Both the updater and recommender can only run a single active Pod at a time. Should you
+want to run a Deployment with more than one pod, it's recommended to enable a lease
+election with the `--leader-elect=true` parameter.
+
+**NOTE**: If using GKE, you must set `--leader-elect-resource-name` to something OTHER than "vpa-recommender", for example "vpa-recommender-lease".
 
 ### What are the parameters to VPA recommender?
 
@@ -203,11 +216,11 @@ Name | Type | Description | Default
 `memory-histogram-decay-half-life` | Duration | The amount of time it takes a historical memory usage sample to lose half of its weight. In other words, a fresh usage sample is twice as 'important' as one with age equal to the half life period. | model.DefaultMemoryHistogramDecayHalfLife
 `cpu-histogram-decay-half-life` | Duration | The amount of time it takes a historical CPU usage sample to lose half of its weight. | model.DefaultCPUHistogramDecayHalfLife
 `cpu-integer-post-processor-enabled` | Bool | Enable the CPU integer recommendation post processor | false
-`leader-elect` | Bool | Start a leader election client and gain leadership before executing the main loop. Enable this when running replicated components for high availability. | false
+`leader-elect` | Bool | Start a leader election client and gain leadership before executing the main loop. Enable this when running replicated components for high availability. **If enabling this in GKE, you MUST also manually set the `--leader-elect-resource-name` flag.** | false
 `leader-elect-lease-duration` | Duration | The duration that non-leader candidates will wait after observing a leadership renewal until attempting to acquire leadership of a led but unrenewed leader slot. This is effectively the maximum duration that a leader can be stopped before it is replaced by another candidate. This is only applicable if leader election is enabled. | 15s
 `leader-elect-renew-deadline` | Duration | The interval between attempts by the acting master to renew a leadership slot before it stops leading. This must be less than the lease duration. This is only applicable if leader election is enabled. | 10s
 `leader-elect-resource-lock` | String | The type of resource object that is used for locking during leader election. Supported options are 'leases', 'endpointsleases' and 'configmapsleases'. | "leases"
-`leader-elect-resource-name` | String | The name of resource object that is used for locking during leader election. | "vpa-recommender"
+`leader-elect-resource-name` | String | The name of resource object that is used for locking during leader election. **If using GKE, you must set this value to something OTHER than "vpa-recommender", for example "vpa-recommender-lease".** | "vpa-recommender"
 `leader-elect-resource-namespace` | String | The namespace of resource object that is used for locking during leader election. | "kube-system"
 `leader-elect-retry-period` | Duration | The duration the clients should wait between attempting acquisition and renewal of a leadership. This is only applicable if leader election is enabled. | 2s
 
@@ -219,7 +232,7 @@ Name | Type | Description | Default
 |-|-|-|-|
 `pod-update-threshold` | Float64 | Ignore updates that have priority lower than the value of this flag | 0.1
 `in-recommendation-bounds-eviction-lifetime-threshold` | Duration | Pods that live for at least that long can be evicted even if their request is within the [MinRecommended...MaxRecommended] range | time.Hour*12
-`evict-after-oom-threshold` | Duration | Evict pod that has only one container and it OOMed in less than evict-after-oom-threshold since start. | 10*time.Minute
+`evict-after-oom-threshold` | Duration | Evict pod that has OOMed in less than evict-after-oom-threshold since start. | 10*time.Minute
 `updater-interval` | Duration | How often updater should run | 1*time.Minute
 `min-replicas` | Int | Minimum number of replicas to perform update | 2
 `eviction-tolerance` | Float64 | Fraction of replica count that can be evicted for update, if more than one pod can be evicted. | 0.5

@@ -31,8 +31,8 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	"k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // hetznerNodeGroup implements cloudprovider.NodeGroup interface. hetznerNodeGroup contains
@@ -251,14 +251,14 @@ func (n *hetznerNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 	return instances, nil
 }
 
-// TemplateNodeInfo returns a schedulerframework.NodeInfo structure of an empty
+// TemplateNodeInfo returns a framework.NodeInfo structure of an empty
 // (as if just started) node. This will be used in scale-up simulations to
 // predict what would a new node look like if a node group was expanded. The
 // returned NodeInfo is expected to have a fully populated Node object, with
 // all of the labels, capacity and allocatable information as well as all pods
 // that are started on the node by default, using manifest (most likely only
 // kube-proxy). Implementation optional.
-func (n *hetznerNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (n *hetznerNodeGroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	resourceList, err := getMachineTypeResourceList(n.manager, n.instanceType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create resource list for node group %s error: %v", n.id, err)
@@ -287,7 +287,7 @@ func (n *hetznerNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, err
 	}
 	node.Labels = cloudprovider.JoinStringMaps(node.Labels, nodeGroupLabels)
 
-	if n.manager.clusterConfig.IsUsingNewFormat && n.id != drainingNodePoolId {
+	if n.manager.clusterConfig.IsUsingNewFormat {
 		for _, taint := range n.manager.clusterConfig.NodeConfigs[n.id].Taints {
 			node.Spec.Taints = append(node.Spec.Taints, apiv1.Taint{
 				Key:    taint.Key,
@@ -297,9 +297,7 @@ func (n *hetznerNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, err
 		}
 	}
 
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(n.id))
-	nodeInfo.SetNode(&node)
-
+	nodeInfo := framework.NewNodeInfo(&node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(n.id)})
 	return nodeInfo, nil
 }
 
@@ -384,14 +382,15 @@ func buildNodeGroupLabels(n *hetznerNodeGroup) (map[string]string, error) {
 	klog.V(4).Infof("Build node group label for %s", n.id)
 
 	labels := map[string]string{
-		apiv1.LabelInstanceType:      n.instanceType,
-		apiv1.LabelTopologyRegion:    n.region,
-		apiv1.LabelArchStable:        archLabel,
-		"csi.hetzner.cloud/location": n.region,
-		nodeGroupLabel:               n.id,
+		apiv1.LabelInstanceType:              n.instanceType,
+		apiv1.LabelTopologyRegion:            n.region,
+		apiv1.LabelArchStable:                archLabel,
+		"csi.hetzner.cloud/location":         n.region,
+		"instance.hetzner.cloud/provided-by": "cloud",
+		nodeGroupLabel:                       n.id,
 	}
 
-	if n.manager.clusterConfig.IsUsingNewFormat && n.id != drainingNodePoolId {
+	if n.manager.clusterConfig.IsUsingNewFormat {
 		maps.Copy(labels, n.manager.clusterConfig.NodeConfigs[n.id].Labels)
 	}
 

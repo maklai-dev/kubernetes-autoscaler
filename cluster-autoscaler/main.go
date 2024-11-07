@@ -66,6 +66,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates/emptycandidates"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates/previouscandidates"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/status"
 	provreqorchestrator "k8s.io/autoscaler/cluster-autoscaler/provisioningrequest/orchestrator"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/drainability/rules"
@@ -87,6 +88,7 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/klog/v2"
 	scheduler_config "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
 // MultiStringFlag is a flag for passing multiple parameters using same flag
@@ -260,17 +262,23 @@ var (
 	maxAllocatableDifferenceRatio           = flag.Float64("max-allocatable-difference-ratio", config.DefaultMaxAllocatableDifferenceRatio, "Maximum difference in allocatable resources between two similar node groups to be considered for balancing. Value is a ratio of the smaller node group's allocatable resource.")
 	forceDaemonSets                         = flag.Bool("force-ds", false, "Blocks scale-up of node groups too small for all suitable Daemon Sets pods.")
 	dynamicNodeDeleteDelayAfterTaintEnabled = flag.Bool("dynamic-node-delete-delay-after-taint-enabled", false, "Enables dynamic adjustment of NodeDeleteDelayAfterTaint based of the latency between CA and api-server")
-	bypassedSchedulers                      = pflag.StringSlice("bypassed-scheduler-names", []string{}, fmt.Sprintf("Names of schedulers to bypass. If set to non-empty value, CA will not wait for pods to reach a certain age before triggering a scale-up."))
+	bypassedSchedulers                      = pflag.StringSlice("bypassed-scheduler-names", []string{}, "Names of schedulers to bypass. If set to non-empty value, CA will not wait for pods to reach a certain age before triggering a scale-up.")
 	drainPriorityConfig                     = flag.String("drain-priority-config", "",
 		"List of ',' separated pairs (priority:terminationGracePeriodSeconds) of integers separated by ':' enables priority evictor. Priority evictor groups pods into priority groups based on pod priority and evict pods in the ascending order of group priorities"+
 			"--max-graceful-termination-sec flag should not be set when this flag is set. Not setting this flag will use unordered evictor by default."+
 			"Priority evictor reuses the concepts of drain logic in kubelet(https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2712-pod-priority-based-graceful-node-shutdown#migration-from-the-node-graceful-shutdown-feature)."+
 			"Eg. flag usage:  '10000:20,1000:100,0:60'")
-	provisioningRequestsEnabled = flag.Bool("enable-provisioning-requests", false, "Whether the clusterautoscaler will be handling the ProvisioningRequest CRs.")
-	frequentLoopsEnabled        = flag.Bool("frequent-loops-enabled", false, "Whether clusterautoscaler triggers new iterations more frequently when it's needed")
-	asyncNodeGroupsEnabled      = flag.Bool("async-node-groups", false, "Whether clusterautoscaler creates and deletes node groups asynchronously. Experimental: requires cloud provider supporting async node group operations, enable at your own risk.")
-	proactiveScaleupEnabled     = flag.Bool("enable-proactive-scaleup", false, "Whether to enable/disable proactive scale-ups, defaults to false")
-	podInjectionLimit           = flag.Int("pod-injection-limit", 5000, "Limits total number of pods while injecting fake pods. If unschedulable pods already exceeds the limit, pod injection is disabled but pods are not truncated.")
+	provisioningRequestsEnabled                  = flag.Bool("enable-provisioning-requests", false, "Whether the clusterautoscaler will be handling the ProvisioningRequest CRs.")
+	provisioningRequestInitialBackoffTime        = flag.Duration("provisioning-request-initial-backoff-time", 1*time.Minute, "Initial backoff time for ProvisioningRequest retry after failed ScaleUp.")
+	provisioningRequestMaxBackoffTime            = flag.Duration("provisioning-request-max-backoff-time", 10*time.Minute, "Max backoff time for ProvisioningRequest retry after failed ScaleUp.")
+	provisioningRequestMaxBackoffCacheSize       = flag.Int("provisioning-request-max-backoff-cache-size", 1000, "Max size for ProvisioningRequest cache size used for retry backoff mechanism.")
+	frequentLoopsEnabled                         = flag.Bool("frequent-loops-enabled", false, "Whether clusterautoscaler triggers new iterations more frequently when it's needed")
+	asyncNodeGroupsEnabled                       = flag.Bool("async-node-groups", false, "Whether clusterautoscaler creates and deletes node groups asynchronously. Experimental: requires cloud provider supporting async node group operations, enable at your own risk.")
+	proactiveScaleupEnabled                      = flag.Bool("enable-proactive-scaleup", false, "Whether to enable/disable proactive scale-ups, defaults to false")
+	podInjectionLimit                            = flag.Int("pod-injection-limit", 5000, "Limits total number of pods while injecting fake pods. If unschedulable pods already exceeds the limit, pod injection is disabled but pods are not truncated.")
+	checkCapacityBatchProcessing                 = flag.Bool("check-capacity-batch-processing", false, "Whether to enable batch processing for check capacity requests.")
+	checkCapacityProvisioningRequestMaxBatchSize = flag.Int("check-capacity-provisioning-request-max-batch-size", 10, "Maximum number of provisioning requests to process in a single batch.")
+	checkCapacityProvisioningRequestBatchTimebox = flag.Duration("check-capacity-provisioning-request-batch-timebox", 10*time.Second, "Maximum time to process a batch of provisioning requests.")
 )
 
 func isFlagPassed(name string) bool {
@@ -439,10 +447,16 @@ func createAutoscalingOptions() config.AutoscalingOptions {
 			MaxAllocatableDifferenceRatio:    *maxAllocatableDifferenceRatio,
 			MaxFreeDifferenceRatio:           *maxFreeDifferenceRatio,
 		},
-		DynamicNodeDeleteDelayAfterTaintEnabled: *dynamicNodeDeleteDelayAfterTaintEnabled,
-		BypassedSchedulers:                      scheduler_util.GetBypassedSchedulersMap(*bypassedSchedulers),
-		ProvisioningRequestEnabled:              *provisioningRequestsEnabled,
-		AsyncNodeGroupsEnabled:                  *asyncNodeGroupsEnabled,
+		DynamicNodeDeleteDelayAfterTaintEnabled:      *dynamicNodeDeleteDelayAfterTaintEnabled,
+		BypassedSchedulers:                           scheduler_util.GetBypassedSchedulersMap(*bypassedSchedulers),
+		ProvisioningRequestEnabled:                   *provisioningRequestsEnabled,
+		AsyncNodeGroupsEnabled:                       *asyncNodeGroupsEnabled,
+		ProvisioningRequestInitialBackoffTime:        *provisioningRequestInitialBackoffTime,
+		ProvisioningRequestMaxBackoffTime:            *provisioningRequestMaxBackoffTime,
+		ProvisioningRequestMaxBackoffCacheSize:       *provisioningRequestMaxBackoffCacheSize,
+		CheckCapacityBatchProcessing:                 *checkCapacityBatchProcessing,
+		CheckCapacityProvisioningRequestMaxBatchSize: *checkCapacityProvisioningRequestMaxBatchSize,
+		CheckCapacityProvisioningRequestBatchTimebox: *checkCapacityProvisioningRequestBatchTimebox,
 	}
 }
 
@@ -461,7 +475,7 @@ func registerSignalHandlers(autoscaler core.Autoscaler) {
 	}()
 }
 
-func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter) (core.Autoscaler, error) {
+func buildAutoscaler(context ctx.Context, debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter) (core.Autoscaler, *loop.LoopTrigger, error) {
 	// Create basic config from flags.
 	autoscalingOptions := createAutoscalingOptions()
 
@@ -480,7 +494,7 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 
 	predicateChecker, err := predicatechecker.NewSchedulerBasedPredicateChecker(informerFactory, autoscalingOptions.SchedulerConfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	deleteOptions := options.NewNodeDeleteOptions(autoscalingOptions)
 	drainabilityRules := rules.Default(deleteOptions)
@@ -501,31 +515,38 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 	opts.Processors.TemplateNodeInfoProvider = nodeinfosprovider.NewDefaultTemplateNodeInfoProvider(nodeInfoCacheExpireTime, *forceDaemonSets)
 	podListProcessor := podlistprocessor.NewDefaultPodListProcessor(opts.PredicateChecker, scheduling.ScheduleAnywhere)
 
+	var ProvisioningRequestInjector *provreq.ProvisioningRequestPodsInjector
 	if autoscalingOptions.ProvisioningRequestEnabled {
 		podListProcessor.AddProcessor(provreq.NewProvisioningRequestPodsFilter(provreq.NewDefautlEventManager()))
 
 		restConfig := kube_util.GetKubeConfig(autoscalingOptions.KubeClientOpts)
 		client, err := provreqclient.NewProvisioningRequestClient(restConfig)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+
+		ProvisioningRequestInjector, err = provreq.NewProvisioningRequestPodsInjector(restConfig, opts.ProvisioningRequestInitialBackoffTime, opts.ProvisioningRequestMaxBackoffTime, opts.ProvisioningRequestMaxBackoffCacheSize)
+		if err != nil {
+			return nil, nil, err
+		}
+		podListProcessor.AddProcessor(ProvisioningRequestInjector)
+
+		var provisioningRequestPodsInjector *provreq.ProvisioningRequestPodsInjector
+		if autoscalingOptions.CheckCapacityBatchProcessing {
+			klog.Infof("Batch processing for check capacity requests is enabled. Passing provisioning request injector to check capacity processor.")
+			provisioningRequestPodsInjector = ProvisioningRequestInjector
+		}
+
 		provreqOrchestrator := provreqorchestrator.New(client, []provreqorchestrator.ProvisioningClass{
-			checkcapacity.New(client),
+			checkcapacity.New(client, provisioningRequestPodsInjector),
 			besteffortatomic.New(client),
 		})
-		scaleUpOrchestrator := provreqorchestrator.NewWrapperOrchestrator(provreqOrchestrator)
 
+		scaleUpOrchestrator := provreqorchestrator.NewWrapperOrchestrator(provreqOrchestrator)
 		opts.ScaleUpOrchestrator = scaleUpOrchestrator
 		provreqProcesor := provreq.NewProvReqProcessor(client, opts.PredicateChecker)
-		if err != nil {
-			return nil, err
-		}
 		opts.LoopStartNotifier = loopstart.NewObserversList([]loopstart.Observer{provreqProcesor})
-		injector, err := provreq.NewProvisioningRequestPodsInjector(restConfig)
-		if err != nil {
-			return nil, err
-		}
-		podListProcessor.AddProcessor(injector)
+
 		podListProcessor.AddProcessor(provreqProcesor)
 	}
 
@@ -537,15 +558,14 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 
 		podListProcessor = pods.NewCombinedPodListProcessor([]pods.PodListProcessor{podInjectionPodListProcessor, podListProcessor, enforceInjectedPodsLimitProcessor})
 
-		// FakePodsScaleUpStatusProcessor processor needs to be the first processor in ScaleUpStatusProcessor as it filters out fake pods from
-		// Scale Up status so that we don't emit events.
-		opts.Processors.ScaleUpStatusProcessor = podinjection.NewFakePodsScaleUpStatusProcessor(podInjectionBackoffRegistry)
+		// FakePodsScaleUpStatusProcessor processor needs to be the first processor in ScaleUpStatusProcessor before the default processor
+		// As it filters out fake pods from Scale Up status so that we don't emit events.
+		opts.Processors.ScaleUpStatusProcessor = status.NewCombinedScaleUpStatusProcessor([]status.ScaleUpStatusProcessor{podinjection.NewFakePodsScaleUpStatusProcessor(podInjectionBackoffRegistry), opts.Processors.ScaleUpStatusProcessor})
 	}
 
 	opts.Processors.PodListProcessor = podListProcessor
-	scaleDownCandidatesComparers := []scaledowncandidates.CandidatesComparer{}
 	sdCandidatesSorting := previouscandidates.NewPreviousCandidates()
-	scaleDownCandidatesComparers = []scaledowncandidates.CandidatesComparer{
+	scaleDownCandidatesComparers := []scaledowncandidates.CandidatesComparer{
 		emptycandidates.NewEmptySortingProcessor(emptycandidates.NewNodeInfoGetter(opts.ClusterSnapshot), deleteOptions, drainabilityRules),
 		sdCandidatesSorting,
 	}
@@ -591,7 +611,7 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 	// Create autoscaler.
 	autoscaler, err := core.NewAutoscaler(opts, informerFactory)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Start informers. This must come after fully constructing the autoscaler because
@@ -599,13 +619,23 @@ func buildAutoscaler(debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter
 	stop := make(chan struct{})
 	informerFactory.Start(stop)
 
-	return autoscaler, nil
+	podObserver := loop.StartPodObserver(context, kube_util.CreateKubeClient(autoscalingOptions.KubeClientOpts))
+
+	// A ProvisioningRequestPodsInjector is used as provisioningRequestProcessingTimesGetter here to obtain the last time a
+	// ProvisioningRequest was processed. This is because the ProvisioningRequestPodsInjector in addition to injecting pods
+	// also marks the ProvisioningRequest as accepted or failed.
+	trigger := loop.NewLoopTrigger(autoscaler, ProvisioningRequestInjector, podObserver, *scanInterval)
+
+	return autoscaler, trigger, nil
 }
 
 func run(healthCheck *metrics.HealthCheck, debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter) {
+	schedulermetrics.Register()
 	metrics.RegisterAll(*emitPerNodeGroupMetrics)
+	context, cancel := ctx.WithCancel(ctx.Background())
+	defer cancel()
 
-	autoscaler, err := buildAutoscaler(debuggingSnapshotter)
+	autoscaler, trigger, err := buildAutoscaler(context, debuggingSnapshotter)
 	if err != nil {
 		klog.Fatalf("Failed to create autoscaler: %v", err)
 	}
@@ -622,11 +652,7 @@ func run(healthCheck *metrics.HealthCheck, debuggingSnapshotter debuggingsnapsho
 	}
 
 	// Autoscale ad infinitum.
-	context, cancel := ctx.WithCancel(ctx.Background())
-	defer cancel()
 	if *frequentLoopsEnabled {
-		podObserver := loop.StartPodObserver(context, kube_util.CreateKubeClient(createAutoscalingOptions().KubeClientOpts))
-		trigger := loop.NewLoopTrigger(podObserver, autoscaler, *scanInterval)
 		lastRun := time.Now()
 		for {
 			trigger.Wait(lastRun)

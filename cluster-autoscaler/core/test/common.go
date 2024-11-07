@@ -27,30 +27,18 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate/utils"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
-	"k8s.io/autoscaler/cluster-autoscaler/core/podlistprocessor"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/deletiontracker"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/pdb"
 	"k8s.io/autoscaler/cluster-autoscaler/debuggingsnapshot"
 	"k8s.io/autoscaler/cluster-autoscaler/expander"
 	"k8s.io/autoscaler/cluster-autoscaler/expander/random"
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
-	"k8s.io/autoscaler/cluster-autoscaler/observers/nodegroupchange"
-	"k8s.io/autoscaler/cluster-autoscaler/processors"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/actionablecluster"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/binpacking"
 	processor_callbacks "k8s.io/autoscaler/cluster-autoscaler/processors/callbacks"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/customresources"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupconfig"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroups"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroups/asyncnodegroups"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/nodegroupset"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/nodeinfosprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
-	"k8s.io/autoscaler/cluster-autoscaler/processors/scaledowncandidates"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/status"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator/predicatechecker"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator/scheduling"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/backoff"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
@@ -61,7 +49,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	kube_client "k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // NodeConfig is a node config used in tests
@@ -113,7 +100,7 @@ type NodeGroupConfig struct {
 // NodeTemplateConfig is a structure to provide node info in tests
 type NodeTemplateConfig struct {
 	MachineType   string
-	NodeInfo      *schedulerframework.NodeInfo
+	NodeInfo      *framework.NodeInfo
 	NodeGroupName string
 }
 
@@ -173,32 +160,6 @@ func ExtractPodNames(pods []*apiv1.Pod) []string {
 		podNames = append(podNames, pod.Name)
 	}
 	return podNames
-}
-
-// NewTestProcessors returns a set of simple processors for use in tests.
-func NewTestProcessors(context *context.AutoscalingContext) *processors.AutoscalingProcessors {
-	return &processors.AutoscalingProcessors{
-		PodListProcessor:       podlistprocessor.NewDefaultPodListProcessor(context.PredicateChecker, scheduling.ScheduleAnywhere),
-		NodeGroupListProcessor: &nodegroups.NoOpNodeGroupListProcessor{},
-		BinpackingLimiter:      binpacking.NewTimeLimiter(context.MaxNodeGroupBinpackingDuration),
-		NodeGroupSetProcessor:  nodegroupset.NewDefaultNodeGroupSetProcessor([]string{}, config.NodeGroupDifferenceRatios{}),
-		ScaleDownSetProcessor: nodes.NewCompositeScaleDownSetProcessor([]nodes.ScaleDownSetProcessor{
-			nodes.NewMaxNodesProcessor(),
-			nodes.NewAtomicResizeFilteringProcessor(),
-		}),
-		// TODO(bskiba): change scale up test so that this can be a NoOpProcessor
-		ScaleUpStatusProcessor:      &status.EventingScaleUpStatusProcessor{},
-		ScaleDownStatusProcessor:    &status.NoOpScaleDownStatusProcessor{},
-		AutoscalingStatusProcessor:  &status.NoOpAutoscalingStatusProcessor{},
-		NodeGroupManager:            nodegroups.NewDefaultNodeGroupManager(),
-		TemplateNodeInfoProvider:    nodeinfosprovider.NewDefaultTemplateNodeInfoProvider(nil, false),
-		NodeGroupConfigProcessor:    nodegroupconfig.NewDefaultNodeGroupConfigProcessor(context.NodeGroupDefaults),
-		CustomResourcesProcessor:    customresources.NewDefaultCustomResourcesProcessor(),
-		ActionableClusterProcessor:  actionablecluster.NewDefaultActionableClusterProcessor(),
-		ScaleDownCandidatesNotifier: scaledowncandidates.NewObserversList(),
-		ScaleStateNotifier:          nodegroupchange.NewNodeGroupChangeObserversList(),
-		AsyncNodeGroupStateChecker:  asyncnodegroups.NewDefaultAsyncNodeGroupStateChecker(),
-	}
 }
 
 // NewScaleTestAutoscalingContext creates a new test autoscaling context for scaling tests.
@@ -323,9 +284,9 @@ type MockAutoprovisioningNodeGroupListProcessor struct {
 }
 
 // Process extends the list of node groups
-func (p *MockAutoprovisioningNodeGroupListProcessor) Process(context *context.AutoscalingContext, nodeGroups []cloudprovider.NodeGroup, nodeInfos map[string]*schedulerframework.NodeInfo,
+func (p *MockAutoprovisioningNodeGroupListProcessor) Process(context *context.AutoscalingContext, nodeGroups []cloudprovider.NodeGroup, nodeInfos map[string]*framework.NodeInfo,
 	unschedulablePods []*apiv1.Pod,
-) ([]cloudprovider.NodeGroup, map[string]*schedulerframework.NodeInfo, error) {
+) ([]cloudprovider.NodeGroup, map[string]*framework.NodeInfo, error) {
 	machines, err := context.CloudProvider.GetAvailableMachineTypes()
 	assert.NoError(p.T, err)
 
@@ -407,7 +368,7 @@ func (r *MockReportingStrategy) LastInputOptions() []GroupSizeChange {
 // BestOption satisfies the Strategy interface. Picks the best option from those passed as an argument.
 // When parameter optionToChoose is defined, it's picked as the best one.
 // Otherwise, random option is used.
-func (r *MockReportingStrategy) BestOption(options []expander.Option, nodeInfo map[string]*schedulerframework.NodeInfo) *expander.Option {
+func (r *MockReportingStrategy) BestOption(options []expander.Option, nodeInfo map[string]*framework.NodeInfo) *expander.Option {
 	r.results.inputOptions = expanderOptionsToGroupSizeChanges(options)
 	if r.optionToChoose == nil {
 		return r.defaultStrategy.BestOption(options, nodeInfo)
